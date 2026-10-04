@@ -1,0 +1,5 @@
+mcp==2.3.0
+PyMySQL[rsa]==1.2.3
+sqlglot==30.21.0
+anyio==4.15.1
+pip==26.2
