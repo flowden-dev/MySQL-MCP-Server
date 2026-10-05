@@ -636,29 +636,64 @@ function Run-Supervisor {
         finally { $hasher.Dispose() }
         $profileLock = [IO.File]::Open((Join-Path $script:BaseData ('tunnel-' + $profileHash + '.lock')), 'OpenOrCreate', 'ReadWrite', 'None')
         Add-TunnelLauncher
-        $keyText = Read-Secret $script:Key
-        $runner = [McpMySql.ManagedTunnel]::new($script:Client, ('run --profile ' + $script:Profile),
-            $script:Root, (Join-Path $script:Data 'tunnel.stdout.log'), (Join-Path $script:Data 'tunnel.stderr.log'), $keyText, $script:Config, $script:ApiKeyEnv)
-        $keyText = $null
-        $supervisor = Get-Process -Id $PID
-        Write-Atomic $script:State (@{ Root=$script:Root; Instance=$Instance; Profile=$script:Profile; SupervisorPid=$PID;
-            SupervisorTicks=$supervisor.StartTime.ToUniversalTime().Ticks.ToString(); ClientPid=$runner.Id } | ConvertTo-Json)
-        $ownedState = $true
-        Write-SupervisorLog ('tunnel started pid=' + $runner.Id)
-        while (!$runner.Wait(250)) {
-            if (Test-StopRequested) { $runner.Stop(); break }
-            # - bound each tunnel log; fail clearly instead of filling the VPS disk
-            foreach ($name in @('tunnel.stdout.log','tunnel.stderr.log')) {
-                if ((Get-Item -LiteralPath (Join-Path $script:Data $name)).Length -gt 10485760) {
-                    throw 'Tunnel log reached 10 MiB; review logging before restarting'
+        $restartDelay = 1
+        while (!(Test-StopRequested)) {
+            $lifetime = [Diagnostics.Stopwatch]::StartNew()
+            try {
+                # - rotate only after the previous job is closed; retain one bounded backup
+                foreach ($name in @('tunnel.stdout.log','tunnel.stderr.log')) {
+                    $path = Join-Path $script:Data $name
+                    if (Test-Path -LiteralPath $path) { Move-Item -LiteralPath $path -Destination ($path + '.1') -Force }
                 }
+                $keyText = Read-Secret $script:Key
+                $runner = [McpMySql.ManagedTunnel]::new($script:Client, ('run --profile ' + $script:Profile),
+                    $script:Root, (Join-Path $script:Data 'tunnel.stdout.log'), (Join-Path $script:Data 'tunnel.stderr.log'), $keyText, $script:Config, $script:ApiKeyEnv)
+                $keyText = $null
+                $supervisor = Get-Process -Id $PID
+                try {
+                    Write-Atomic $script:State (@{ Root=$script:Root; Instance=$Instance; Profile=$script:Profile; SupervisorPid=$PID;
+                        SupervisorTicks=$supervisor.StartTime.ToUniversalTime().Ticks.ToString(); ClientPid=$runner.Id } | ConvertTo-Json)
+                } finally { $supervisor.Dispose() }
+                $ownedState = $true
+                Write-SupervisorLog ('tunnel started pid=' + $runner.Id)
+                while (!$runner.Wait(250)) {
+                    if (Test-StopRequested) { $runner.Stop(); break }
+                    # - recycle the tunnel at the log limit instead of leaving the instance offline
+                    $logLimit = $false
+                    foreach ($name in @('tunnel.stdout.log','tunnel.stderr.log')) {
+                        if ((Get-Item -LiteralPath (Join-Path $script:Data $name)).Length -gt 10485760) { $logLimit = $true; break }
+                    }
+                    if ($logLimit) {
+                        Write-SupervisorLog 'tunnel log reached 10 MiB; recycling tunnel'
+                        $runner.Stop()
+                        break
+                    }
+                }
+                if (!$runner.Wait(5000)) { throw 'Tunnel did not exit' }
+                $exitCode = $runner.ExitCode
+                if (Test-StopRequested) { $exitCode = 0 }
+                elseif ($exitCode -eq 0) { $exitCode = 1 }
+                Write-SupervisorLog ('tunnel exited code=' + $exitCode)
+            } catch {
+                # - retry without logging exceptions that might contain credentials
+                Write-SupervisorLog 'tunnel failed; verify profile, dependencies, saved keys and tunnel logs'
+                $exitCode = 1
+            } finally {
+                $keyText = $null
+                if ($null -ne $runner) { $runner.Dispose(); $runner = $null }
+                if ($ownedState) { Remove-Item -LiteralPath $script:State -Force -ErrorAction SilentlyContinue; $ownedState = $false }
             }
+            if (Test-StopRequested) { return 0 }
+            if ($lifetime.Elapsed.TotalSeconds -ge 60) { $restartDelay = 1 }
+            Write-SupervisorLog ('tunnel restart in seconds=' + $restartDelay)
+            $delay = [Diagnostics.Stopwatch]::StartNew()
+            while ($delay.Elapsed.TotalSeconds -lt $restartDelay) {
+                if (Test-StopRequested) { return 0 }
+                Start-Sleep -Milliseconds 250
+            }
+            $restartDelay = [Math]::Min(60, $restartDelay * 2)
         }
-        $runner.Wait(5000) | Out-Null
-        $exitCode = $runner.ExitCode
-        if (Test-StopRequested) { $exitCode = 0 }
-        elseif ($exitCode -eq 0) { $exitCode = 1 }
-        Write-SupervisorLog ('tunnel exited code=' + $exitCode)
+        $exitCode = 0
     } catch {
         # - do not copy exception text that could contain the tunnel environment
         Write-SupervisorLog 'supervisor failed; verify profile, dependencies, saved keys and tunnel logs'
